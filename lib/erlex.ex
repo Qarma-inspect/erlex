@@ -83,6 +83,7 @@ defmodule Erlex do
       |> to_charlist()
       |> lex()
       |> parse()
+      |> IO.inspect(label: "Parsed")
 
     try do
       do_pretty_print(parsed)
@@ -90,6 +91,166 @@ defmodule Erlex do
       _ ->
         throw({:error, :pretty_printing, parsed})
     end
+  end
+
+  @spec pretty_print_diff(expected :: String.t(), actual :: String.t()) :: String.t()
+  def pretty_print_diff(expected, actual) do
+    parsed_expected =
+      expected
+      |> to_charlist()
+      |> lex()
+      |> parse()
+
+    parsed_actual =
+      actual
+      |> to_charlist()
+      |> lex()
+      |> parse()
+
+    do_pretty_print_diff(parsed_expected, parsed_actual, [])
+  end
+
+  defp do_pretty_print_diff({:atom, expected}, {:atom, actual}, _context_path) do
+    "Expected atom #{expected}, got #{actual}"
+  end
+
+  defp do_pretty_print_diff({:atom, expected}, actual, _context_path) do
+    "Expected atom #{expected}, got #{do_pretty_print(actual)}"
+  end
+
+  defp do_pretty_print_diff({:map, expected_entries}, {:map, actual_entries}, _context_path) do
+    expected_struct = struct_from_entries(expected_entries)
+    actual_struct = struct_from_entries(actual_entries)
+
+    if actual_struct != expected_struct do
+      """
+      Expected struct #{expected_struct} got #{actual_struct}
+      """
+    else
+      invalid_entries = do_map_diff(expected_entries, actual_entries)
+
+      """
+      Found mismatched fields: #{inspect(invalid_entries, pretty: true)}
+      """
+    end
+  end
+
+  defp do_pretty_print_diff({:map, _}, actual, _context_path) do
+    "Expected a map, but got #{do_pretty_print(actual)}"
+  end
+
+  defp struct_from_entries(entries) do
+    entries
+    |> Enum.find(fn
+        {:map_entry, {:atom, '\'__struct__\''}, {:atom, _}} -> true
+        _ -> false
+      end)
+    |> case do
+      nil -> nil
+      {:map_entry, {:atom, '\'__struct__\''}, {:atom, name}} -> List.to_string(name)
+    end
+  end
+
+  defp do_map_diff(expected_entries, actual_entries) do
+    invalid_keys =
+      expected_entries
+      |> Enum.flat_map(&find_invalid_types(&1, actual_entries))
+      |> Enum.reject(& &1 == [])
+
+    unexpected_keys = find_unexpected_keys(expected_entries, actual_entries)
+
+    invalid_keys ++ unexpected_keys
+  end
+
+  defp find_invalid_types(expected_type, actual_entries) do
+    case expected_type do
+      # We did struct checking earlier
+      {:map_entry, {:atom, '\'__struct__\''}, {:atom, _}} -> []
+      {:map_entry, expected_key, expected_value} ->
+        actual_value = find_key_type(actual_entries, expected_key)
+        key = to_atom(expected_key)
+
+        case {expected_value, actual_value} do
+          {_, nil} ->
+            [[key]]
+
+          {{:map, expected_entries}, {:map, actual_entries}} ->
+            expected_struct = struct_from_entries(expected_entries)
+            actual_struct = struct_from_entries(actual_entries)
+
+            if actual_struct != expected_struct do
+              [[key]]
+            else
+              invalid_keys =
+                expected_entries
+                |> Enum.flat_map(&find_invalid_types(&1, actual_entries))
+                |> Enum.reject(& &1 == [])
+
+              unexpected_keys = find_unexpected_keys(expected_entries, actual_entries)
+
+              case invalid_keys ++ unexpected_keys do
+                [] -> []
+                keys_list -> Enum.map(keys_list, fn keys -> [key | keys] end)
+              end
+            end
+
+          _ ->
+            if matching_type?(expected_value, actual_value) do
+              []
+            else
+              [[key]]
+            end
+        end
+    end
+  end
+
+  defp find_unexpected_keys(expected_entries, actual_entries) do
+    actual_entries
+    |> Enum.map(fn {:map_entry, actual_key, _actual_value} ->
+      case find_key_type(expected_entries, actual_key) do
+        nil -> [to_atom(actual_key)]
+        _ -> []
+      end
+    end)
+    |> Enum.reject(& &1 == [])
+  end
+
+  defp find_key_type(entries, key_type) do
+    Enum.find_value(entries, fn {:map_entry, ^key_type, value_type} -> value_type
+    _ -> nil
+    end)
+  end
+
+  defp matching_type?({:type_list, ['b', 'i', 'n', 'a', 'r', 'y'], {:list, :paren, []}}, actual_type) do
+    case actual_type do
+      {:binary, [{:binary_part, {:any}, {:int, _}}]} -> true
+      {:type_list, ['b', 'i', 'n', 'a', 'r', 'y'], {:list, :paren, []}} -> true
+      _ -> false
+    end
+  end
+
+  defp matching_type?({:type_list, ['a', 't', 'o', 'm'], {:list, :paren, []}}, actual_type) do
+    case actual_type do
+      {:atom, atom} when is_list(atom) -> true
+      _ -> false
+    end
+  end
+
+  defp matching_type?({:tuple, expected_tuple}, {:tuple, actual_tuple}) when length(expected_tuple) == length(actual_tuple) do
+    expected_tuple
+    |> Enum.zip(actual_tuple)
+    |> Enum.all?(fn {expected_type, actual_type} -> matching_type?(expected_type, actual_type) end)
+  end
+
+  defp matching_type?(_expected_type, _actual_type) do
+    false
+  end
+
+  defp to_atom({:atom, atom_name}) do
+    atom_name
+    |> to_string()
+    |> String.slice(1..-2)
+    |> String.to_atom()
   end
 
   @spec pretty_print_pattern(pattern :: String.t()) :: String.t()
