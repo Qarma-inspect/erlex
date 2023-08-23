@@ -92,6 +92,346 @@ defmodule Erlex do
     end
   end
 
+  @spec pretty_print_diff(expected :: String.t(), actual :: String.t()) :: String.t()
+  def pretty_print_diff(expected, actual) do
+    parsed_expected =
+      expected
+      |> to_charlist()
+      |> lex()
+      |> parse()
+
+    parsed_actual =
+      actual
+      |> to_charlist()
+      |> lex()
+      |> parse()
+
+    pretty_print_diff_parsed(parsed_expected, parsed_actual)
+  end
+
+  defp pretty_print_diff_parsed({:map, expected_entries} = expected, {:map, actual_entries} = actual) do
+    expected_struct = struct_from_entries(expected_entries)
+    actual_struct = struct_from_entries(actual_entries)
+
+    if actual_struct == expected_struct do
+      invalid_entries =
+        expected
+        |> find_invalid_entries(actual)
+        |> format_invalid_entries()
+
+      """
+
+      Mismatched fields:
+      #{invalid_entries}
+      """
+    else
+      ""
+    end
+  end
+
+  defp pretty_print_diff_parsed({:tuple, expected_entries} = expected, {:tuple, actual_entries} = actual) do
+    expected_length = length(expected_entries)
+    actual_length = length(actual_entries)
+
+    if expected_length == actual_length do
+      invalid_entries =
+        expected
+        |> find_invalid_entries(actual)
+        |> format_invalid_entries()
+
+      """
+
+      Mismatched fields:
+      #{invalid_entries}
+      """
+    else
+      """
+
+      Expected tuple size is #{expected_length}, got one of size #{actual_length}.
+      """
+    end
+  end
+
+  defp pretty_print_diff_parsed({:list, :paren, expected_args}, {:list, :paren, actual_args}) do
+    expected_args
+    |> Enum.zip(actual_args)
+    |> Enum.with_index()
+    |> Enum.map(fn {{expected_arg, actual_arg}, index} ->
+      expected_arg
+      |> find_invalid_entries(actual_arg)
+      |> format_invalid_entries()
+      |> case do
+        "" ->
+          ""
+
+        invalid_entries ->
+          """
+
+          #{ordinal(index + 1)} argument:
+          #{invalid_entries}
+          """
+      end
+    end)
+    |> List.to_string()
+  end
+
+  defp pretty_print_diff_parsed({:contract, {:args, expected_args_list}, {:return, _return}}, actual_args_list) do
+    pretty_print_diff_parsed(expected_args_list, actual_args_list)
+  end
+
+  defp pretty_print_diff_parsed(_, _) do
+    ""
+  end
+
+  defp find_invalid_entries({:map, expected_entries}, {:map, actual_entries}) do
+    expected_struct = struct_from_entries(expected_entries)
+    actual_struct = struct_from_entries(actual_entries)
+
+    if expected_struct == actual_struct do
+      unexpected_entries = find_unexpected_entries(expected_entries, actual_entries)
+      invalid_entries = Enum.flat_map(expected_entries, &find_invalid_map_entries(&1, actual_entries))
+
+      invalid_entries ++ unexpected_entries
+    else
+      [{[], expected_struct, actual_struct}]
+    end
+  end
+
+  defp find_invalid_entries({:tuple, expected_entries}, {:tuple, actual_entries}) do
+    expected_length = length(expected_entries)
+    actual_length = length(actual_entries)
+
+    if expected_length == actual_length do
+      expected_entries
+      |> Enum.zip(actual_entries)
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {{expected_entry, actual_entry}, index} ->
+        expected_entry
+        |> find_invalid_entries(actual_entry)
+        |> prepend_key(index)
+      end)
+    else
+      [{[], :mismatched_tuple_size, expected_length, actual_length}]
+    end
+  end
+
+  defp find_invalid_entries(expected, actual) do
+    if matching_type?(expected, actual) do
+      []
+    else
+      [{[], do_shallow_pretty_print(expected), do_shallow_pretty_print(actual)}]
+    end
+  end
+
+  defp find_invalid_map_entries(expected_entry, actual_entries) do
+    case expected_entry do
+      {:map_entry, {:atom, '\'__struct__\''}, {:atom, _struct_name}} ->
+        []
+
+      {:map_entry, {:atom, [:_]}, _expected_value} ->
+        []
+
+      {:map_entry, expected_key, expected_value} ->
+        key = to_atom(expected_key)
+
+        case find_entry_value(actual_entries, expected_key) do
+          {:error, :not_found} ->
+            [{[key], :not_found}]
+
+          actual_value ->
+            expected_value
+            |> find_invalid_entries(actual_value)
+            |> prepend_key(key)
+        end
+    end
+  end
+
+  defp prepend_key(invalid_entries_list, key) do
+    Enum.map(invalid_entries_list, fn
+      {keys, expected, actual} ->
+        {[key | keys], expected, actual}
+
+      {keys, :not_found} ->
+        {[key | keys], :not_found}
+
+      {keys, :unexpected} ->
+        {[key | keys], :unexpected}
+
+      {keys, :mismatched_tuple_size, expected_length, actual_length} ->
+        {[key | keys], :mismatched_tuple_size, expected_length, actual_length}
+    end)
+  end
+
+  defp struct_from_entries(entries) do
+    entries
+    |> Enum.find(fn
+        {:map_entry, {:atom, '\'__struct__\''}, {:atom, _}} -> true
+        _ -> false
+      end)
+    |> case do
+      nil ->
+        nil
+
+      {:map_entry, {:atom, '\'__struct__\''}, {:atom, name}} ->
+        name
+        |> List.to_string()
+        |> String.trim("'")
+    end
+  end
+
+  defp find_entry_value(entries, key) do
+    entries
+    |> Map.new(fn {:map_entry, key_type, value_type} -> {key_type, value_type} end)
+    |> Map.get(key, {:error, :not_found})
+  end
+
+  defp to_atom({:atom, atom_name}) do
+    atom_name
+    |> to_string()
+    |> String.slice(1..-2)
+    |> String.to_atom()
+  end
+
+  defp find_unexpected_entries(expected_entries, actual_entries) do
+    Enum.flat_map(actual_entries, fn {:map_entry, actual_key, _actual_value} ->
+      case find_entry_value(expected_entries, actual_key) do
+        {:error, :not_found} -> [{[to_atom(actual_key)], :unexpected}]
+        _ -> []
+      end
+    end)
+  end
+
+  defp ordinal(1), do: "1st"
+  defp ordinal(2), do: "2nd"
+  defp ordinal(3), do: "3rd"
+  defp ordinal(n) when is_integer(n), do: "#{n}th"
+
+  defp matching_type?({:atom, expected_atom}, {:atom, actual_atom}) do
+    expected_atom == actual_atom
+  end
+
+  defp matching_type?({:type_list, ['b', 'i', 'n', 'a', 'r', 'y'], {:list, :paren, []}}, actual_type) do
+    case actual_type do
+      {:binary, [{:binary_part, {:any}, {:int, _}}]} -> true
+      {:type_list, ['b', 'i', 'n', 'a', 'r', 'y'], {:list, :paren, []}} -> true
+      _ -> false
+    end
+  end
+
+  defp matching_type?({:type_list, ['f', 'l', 'o', 'a', 't'], {:list, :paren, []}}, actual_type) do
+    case actual_type do
+      {:type_list, ['f', 'l', 'o', 'a', 't'], {:list, :paren, []}} -> true
+      _ -> false
+    end
+  end
+
+  defp matching_type?({:type_list, ['a', 't', 'o', 'm'], {:list, :paren, []}}, actual_type) do
+    case actual_type do
+      {:atom, atom} when is_list(atom) -> true
+      _ -> false
+    end
+  end
+
+  defp matching_type?({:tuple, expected_tuple}, {:tuple, actual_tuple}) when length(expected_tuple) == length(actual_tuple) do
+    expected_tuple
+    |> Enum.zip(actual_tuple)
+    |> Enum.all?(fn {expected_type, actual_type} -> matching_type?(expected_type, actual_type) end)
+  end
+
+  defp matching_type?(_expected_type, _actual_type) do
+    false
+  end
+
+  defp format_invalid_entries(invalid_entries) do
+    invalid_entries
+    |> Enum.reject(fn entry -> elem(entry, 0) == [] end)
+    |> Enum.map(fn
+      {keys, expected, actual} ->
+        "#{inspect(keys)}: expected #{inspect(expected)}, got #{inspect(actual)}"
+
+      {keys, :not_found} ->
+        "#{inspect(keys)}: not found"
+
+      {keys, :unexpected} ->
+        "#{inspect(keys)}: unexpected key"
+
+      {keys, :mismatched_tuple_size, expected_size, actual_size} ->
+        "#{inspect(keys)}: expected tuple size is #{expected_size}, got one of size #{actual_size}"
+    end)
+    |> Enum.join("\n")
+  end
+
+  @spec shallow_pretty_print_type(type :: String.t()) :: String.t()
+  def shallow_pretty_print_type(type) do
+    prefix = "@spec a("
+    suffix = ") :: :ok\ndef a() do\n  :ok\nend"
+    indented_suffix = ") ::\n        :ok\ndef a() do\n  :ok\nend"
+    pretty = shallow_pretty_print(type)
+
+    """
+    @spec a(#{pretty}) :: :ok
+    def a() do
+      :ok
+    end
+    """
+    |> format()
+    |> Enum.join("")
+    |> String.trim_leading(prefix)
+    |> String.trim_trailing(suffix)
+    |> String.trim_trailing(indented_suffix)
+    |> String.replace("\n      ", "\n")
+  end
+
+  defp shallow_pretty_print(str) do
+    parsed =
+      str
+      |> to_charlist()
+      |> lex()
+      |> parse()
+
+    try do
+      do_shallow_pretty_print(parsed)
+    rescue
+      _ ->
+        throw({:error, :pretty_printing, parsed})
+    end
+  end
+
+  defp do_shallow_pretty_print({:contract, {:args, args}, {:return, return}, {:whens, whens}}) do
+    {printed_whens, when_names} = collect_and_print_whens(whens)
+
+    args = {:when_names, when_names, args}
+    return = {:when_names, when_names, return}
+
+    "(#{do_shallow_pretty_print(args)}) :: #{do_shallow_pretty_print(return)} when #{printed_whens}"
+  end
+
+  defp do_shallow_pretty_print({:contract, {:args, {:inner_any_function}}, {:return, return}}) do
+    "((...) -> #{do_shallow_pretty_print(return)})"
+  end
+
+  defp do_shallow_pretty_print({:contract, {:args, args}, {:return, return}}) do
+    "#{do_shallow_pretty_print(args)} :: #{do_shallow_pretty_print(return)}"
+  end
+
+  defp do_shallow_pretty_print({:list, :paren, items}) do
+    "(#{Enum.map_join(items, ", ", &do_shallow_pretty_print/1)})"
+  end
+
+  defp do_shallow_pretty_print({:map, map_keys}) do
+    case struct_parts(map_keys) do
+      %{name: name} -> "%#{name}{}"
+    end
+  end
+
+  defp do_shallow_pretty_print({:tuple, _tuple_items}) do
+    "tuple()"
+  end
+
+  defp do_shallow_pretty_print(parsed) do
+    do_pretty_print(parsed)
+  end
+
   @spec pretty_print_pattern(pattern :: String.t()) :: String.t()
   def pretty_print_pattern('pattern ' ++ rest) do
     pretty_print_type(rest)
@@ -121,6 +461,40 @@ defmodule Erlex do
     [head | tail]
     |> Enum.join(";")
     |> pretty_print_contract()
+  end
+
+  @spec shallow_pretty_print_contract(contract :: String.t()) :: String.t()
+  def shallow_pretty_print_contract(contract) do
+    [head | tail] =
+      contract
+      |> to_string()
+      |> String.split(";")
+
+    if Enum.empty?(tail) do
+      do_shallow_pretty_print_contract(head)
+    else
+      joiner = "Contract head:\n"
+
+      joiner <> Enum.map_join([head | tail], "\n\n" <> joiner, &do_shallow_pretty_print_contract/1)
+    end
+  end
+
+  defp do_shallow_pretty_print_contract(contract) do
+    prefix = "@spec a"
+    suffix = "\ndef a() do\n  :ok\nend"
+    pretty = shallow_pretty_print(contract)
+
+    """
+    @spec a#{pretty}
+    def a() do
+      :ok
+    end
+    """
+    |> format()
+    |> Enum.join("")
+    |> String.trim_leading(prefix)
+    |> String.trim_trailing(suffix)
+    |> String.replace("\n      ", "\n")
   end
 
   @spec pretty_print_contract(contract :: String.t()) :: String.t()
@@ -183,6 +557,25 @@ defmodule Erlex do
     prefix = "@spec a"
     suffix = " :: :ok\ndef a() do\n  :ok\nend"
     pretty = pretty_print(args)
+
+    """
+    @spec a#{pretty} :: :ok
+    def a() do
+      :ok
+    end
+    """
+    |> format()
+    |> Enum.join("")
+    |> String.trim_leading(prefix)
+    |> String.trim_trailing(suffix)
+    |> String.replace("\n      ", "\n")
+  end
+
+  @spec shallow_pretty_print_args(args :: String.t()) :: String.t()
+  def shallow_pretty_print_args(args) do
+    prefix = "@spec a"
+    suffix = " :: :ok\ndef a() do\n  :ok\nend"
+    pretty = shallow_pretty_print(args)
 
     """
     @spec a#{pretty} :: :ok
