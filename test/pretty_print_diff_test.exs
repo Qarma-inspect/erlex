@@ -166,11 +166,9 @@ defmodule Erlex.Test.PretyPrintDiffTest do
   end
 
   test "different tuple size" do
-    expected =
-      '{binary(),non_neg_integer(),binary()}'
+    expected = '{binary(),non_neg_integer(),binary()}'
 
-    actual =
-      '{binary(),<<_:24>>}'
+    actual = '{binary(),<<_:24>>}'
 
     pretty_printed = Erlex.pretty_print_diff(expected, actual)
 
@@ -183,11 +181,9 @@ defmodule Erlex.Test.PretyPrintDiffTest do
   end
 
   test "different nested tuple size" do
-    expected =
-      '\#{\'first\':={float(),float(),float()}, \'second\':={float(),binary()}}'
+    expected = '\#{\'first\':={float(),float(),float()}, \'second\':={float(),binary()}}'
 
-    actual =
-      '\#{\'first\':={float(),binary()}, \'second\':={float(),float(),float()}}'
+    actual = '\#{\'first\':={float(),binary()}, \'second\':={float(),float(),float()}}'
 
     pretty_printed = Erlex.pretty_print_diff(expected, actual)
 
@@ -196,6 +192,39 @@ defmodule Erlex.Test.PretyPrintDiffTest do
     Mismatched fields:
     [:first]: expected tuple size is 3, got one of size 2
     [:second]: expected tuple size is 2, got one of size 3
+    """
+
+    assert pretty_printed == expected_output
+  end
+
+  test "different function arguments" do
+    expected = '(\#{\'a\':=\'ok\', \'b\':=\'error\', _=>_},binary())'
+
+    actual = '(\#{\'a\'=>\'ok\', \'c\'=>\'error\'},float())'
+
+    pretty_printed = Erlex.pretty_print_diff(expected, actual)
+
+    expected_output = ~S"""
+
+    1st argument:
+    [:b]: not found
+    [:c]: unexpected key
+    """
+
+    assert pretty_printed == expected_output
+  end
+
+  test "broken contract" do
+    expected_contract = '(\#{\'a\':=\'ok\',\'b\':=\'error\'},\'ok\') -> \'ok\''
+
+    actual_args = '(\#{\'a\'=>\'ok\',\'b\':=\'ok\'},\'ok\')'
+
+    pretty_printed = Erlex.pretty_print_diff(expected_contract, actual_args)
+
+    expected_output = ~S"""
+
+    1st argument:
+    [:b]: expected ":error", got ":ok"
     """
 
     assert pretty_printed == expected_output
